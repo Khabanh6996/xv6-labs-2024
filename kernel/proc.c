@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "procinfo.h"
 
 struct cpu cpus[NCPU];
 
@@ -695,4 +696,45 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+int
+procinfo_get(int pid, uint64 info_addr)
+{
+  struct proc *p;
+  struct proc *my_p = myproc();
+  struct procinfo info;
+  int found = 0;
+
+  // Duyệt qua toàn bộ bảng tiến trình
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    // Tìm tiến trình có PID trùng khớp và đang hoạt động
+    if(p->pid == pid && p->state != UNUSED){
+      info.pid = p->pid;
+      info.state = p->state;
+      info.sz = p->sz;
+      safestrcpy(info.name, p->name, sizeof(info.name)); // Copy tên an toàn
+      
+      // Lấy ID của tiến trình cha (nếu có)
+      if(p->parent)
+        info.ppid = p->parent->pid;
+      else
+        info.ppid = 0;
+        
+      found = 1;
+      release(&p->lock);
+      break;
+    }
+    release(&p->lock);
+  }
+
+  // Nếu không tìm thấy tiến trình, trả về lỗi
+  if(!found) return -1;
+
+  // Dùng copyout để chép dữ liệu từ kernel space ra user space một cách an toàn
+  if(copyout(my_p->pagetable, info_addr, (char *)&info, sizeof(info)) < 0)
+    return -1;
+
+  return 0;
 }
