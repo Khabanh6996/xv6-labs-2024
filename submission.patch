@@ -1,0 +1,510 @@
+diff --git a/Makefile b/Makefile
+index 74e454f..6c21542 100644
+--- a/Makefile
++++ b/Makefile
+@@ -182,6 +182,7 @@ UPROGS=\
+ 	$U/_echo\
+ 	$U/_forktest\
+ 	$U/_grep\
++        $U/_tree\
+ 	$U/_init\
+ 	$U/_kill\
+ 	$U/_ln\
+@@ -194,6 +195,9 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_trace\
++	$U/_test_procinfo\
++	$U/_xargs\
+ 
+ 
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d1b6bb9..a33e0dd 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -106,6 +106,7 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             procinfo_get(int, uint64);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 130d9ce..241bafd 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "procinfo.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -299,6 +300,9 @@ fork(void)
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+ 
++  // 
++  np->trace_mask = p->trace_mask;
++
+   // Cause fork to return 0 in the child.
+   np->trapframe->a0 = 0;
+ 
+@@ -693,3 +697,44 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++int
++procinfo_get(int pid, uint64 info_addr)
++{
++  struct proc *p;
++  struct proc *my_p = myproc();
++  struct procinfo info;
++  int found = 0;
++
++  // Duyệt qua toàn bộ bảng tiến trình
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    // Tìm tiến trình có PID trùng khớp và đang hoạt động
++    if(p->pid == pid && p->state != UNUSED){
++      info.pid = p->pid;
++      info.state = p->state;
++      info.sz = p->sz;
++      safestrcpy(info.name, p->name, sizeof(info.name)); // Copy tên an toàn
++      
++      // Lấy ID của tiến trình cha (nếu có)
++      if(p->parent)
++        info.ppid = p->parent->pid;
++      else
++        info.ppid = 0;
++        
++      found = 1;
++      release(&p->lock);
++      break;
++    }
++    release(&p->lock);
++  }
++
++  // Nếu không tìm thấy tiến trình, trả về lỗi
++  if(!found) return -1;
++
++  // Dùng copyout để chép dữ liệu từ kernel space ra user space một cách an toàn
++  if(copyout(my_p->pagetable, info_addr, (char *)&info, sizeof(info)) < 0)
++    return -1;
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..268c835 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,7 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int trace_mask;
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/procinfo.h b/kernel/procinfo.h
+new file mode 100644
+index 0000000..6945af1
+--- /dev/null
++++ b/kernel/procinfo.h
+@@ -0,0 +1,7 @@
++struct procinfo {
++  int pid;          // Process ID
++  int ppid;         // Parent process ID
++  int state;        // Process state (see kernel/proc.h)
++  uint64 sz;        // Size of process memory (bytes)
++  char name[16];    // Process name
++};
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..8a12020 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_trace(void);
++extern uint64 sys_procinfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,34 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_trace]   sys_trace,
++[SYS_procinfo] sys_procinfo,
++};
++
++static char *syscall_names[] = {
++[SYS_fork]     "fork",
++[SYS_exit]     "exit",
++[SYS_wait]     "wait",
++[SYS_pipe]     "pipe",
++[SYS_read]     "read",
++[SYS_kill]     "kill",
++[SYS_exec]     "exec",
++[SYS_fstat]    "fstat",
++[SYS_chdir]    "chdir",
++[SYS_dup]      "dup",
++[SYS_getpid]   "getpid",
++[SYS_sbrk]     "sbrk",
++[SYS_sleep]    "sleep",
++[SYS_uptime]   "uptime",
++[SYS_open]     "open",
++[SYS_write]    "write",
++[SYS_mknod]    "mknod",
++[SYS_unlink]   "unlink",
++[SYS_link]     "link",
++[SYS_mkdir]    "mkdir",
++[SYS_close]    "close",
++[SYS_trace]    "trace",
++[SYS_procinfo] "procinfo", 
+ };
+ 
+ void
+@@ -136,12 +166,20 @@ syscall(void)
+ 
+   num = p->trapframe->a7;
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+-    // Use num to lookup the system call function for num, call it,
+-    // and store its return value in p->trapframe->a0
++    // Thực thi system call và lưu kết quả trả về vào a0
+     p->trapframe->a0 = syscalls[num]();
++
++    // Kiểm tra xem bit tương ứng với system call này có bật trong mask không
++    if ((p->trace_mask & (1 << num)) != 0) {
++        // In ra định dạng: <pid>: syscall <tên> -> <giá trị trả về>
++        printf("%d: syscall %s -> %d\n", p->pid, syscall_names[num], (int)p->trapframe->a0);
++    }
+   } else {
+-    printf("%d %s: unknown sys call %d\n",
+-            p->pid, p->name, num);
++    printf("%d %s: unknown sys call %d\n", p->pid, p->name, num);
+     p->trapframe->a0 = -1;
+   }
+ }
++
++
++
++
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..4bafbb1 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_trace  22
++#define SYS_procinfo 23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..960ec3e 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,6 +5,7 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "procinfo.h"
+ 
+ uint64
+ sys_exit(void)
+@@ -91,3 +92,31 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_trace(void)
++{
++  int mask;
++  
++  // Lấy đối số nguyên đầu tiên từ user space và gán vào mask
++  argint(0, &mask);
++  
++  // Lưu mask vào cấu trúc proc của tiến trình hiện tại
++  myproc()->trace_mask = mask;
++  
++  return 0;
++}
++
++uint64
++sys_procinfo(void)
++{
++  int pid;
++  uint64 info_addr; // Địa chỉ của struct procinfo ở không gian người dùng
++
++  // Lấy tham số 1 (pid) và tham số 2 (địa chỉ info) trực tiếp
++  argint(0, &pid);
++  argaddr(1, &info_addr);
++
++  // Gọi hàm tìm kiếm
++  return procinfo_get(pid, info_addr);
++}
+\ No newline at end of file
+diff --git a/user/test_procinfo.c b/user/test_procinfo.c
+new file mode 100644
+index 0000000..46e5c44
+--- /dev/null
++++ b/user/test_procinfo.c
+@@ -0,0 +1,28 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/procinfo.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  struct procinfo info;
++  
++  // Lấy PID của chính chương trình đang chạy này
++  int my_pid = getpid(); 
++
++  // Truyền PID và địa chỉ bộ nhớ của biến info vào system call procinfo
++  if(procinfo(my_pid, &info) == 0){
++    printf("Process: %s\n", info.name);
++    printf("PID: %d, PPID: %d\n", info.pid, info.ppid);
++    printf("State: %d\n", info.state); 
++    
++    // Ép kiểu info.sz về int để khớp với %d
++    printf("Memory: %d bytes\n", (int)info.sz); 
++  } else {
++    printf("Error: procinfo failed to retrieve data.\n");
++  }
++
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/trace.c b/user/trace.c
+new file mode 100644
+index 0000000..f2db410
+--- /dev/null
++++ b/user/trace.c
+@@ -0,0 +1,30 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  int i;
++  char *nargv[MAXARG];
++
++  if(argc < 3 || (argv[1][0] < '0' || argv[1][0] > '9')){
++    fprintf(2, "Usage: %s mask command\n", argv[0]);
++    exit(1);
++  }
++
++  if (trace(atoi(argv[1])) < 0) {
++    fprintf(2, "%s: trace failed\n", argv[0]);
++    exit(1);
++  }
++
++  for(i = 2; i < argc && i < MAXARG; i++){
++    nargv[i-2] = argv[i];
++  }
++  nargv[i-2] = 0;
++
++  exec(nargv[0], nargv);
++  printf("exec %s failed\n", nargv[0]);
++  exit(1);
++}
+\ No newline at end of file
+diff --git a/user/tree.c b/user/tree.c
+new file mode 100644
+index 0000000..bf777a7
+--- /dev/null
++++ b/user/tree.c
+@@ -0,0 +1,96 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++#include "user/user.h"
++
++char*
++name_from_path(char *path)
++{
++  char *p;
++
++  for(p = path + strlen(path); p >= path && *p != '/'; p--)
++    ;
++  p++;
++
++  return p;
++}
++
++void
++tree(char *path, int depth)
++{
++  char buf[512], *p;
++  int fd;
++  struct dirent de;
++  struct stat st;
++
++  if((fd = open(path, O_RDONLY)) < 0){
++    fprintf(2, "tree: cannot open %s\n", path);
++    return;
++  }
++
++  if(fstat(fd, &st) < 0){
++    fprintf(2, "tree: cannot stat %s\n", path);
++    close(fd);
++    return;
++  }
++
++  // indentation
++  for(int i = 0; i < depth; i++)
++    printf("  ");
++
++  // print only name
++  char *name = name_from_path(path);
++  printf("%s", name);
++
++  if(st.type == T_DIR)
++    printf("/");
++
++  printf("\n");
++
++  if(st.type != T_DIR){
++    close(fd);
++    return;
++  }
++
++  if(strlen(path) + 1 + DIRSIZ + 1 > sizeof(buf)){
++    printf("tree: path too long\n");
++    close(fd);
++    return;
++  }
++
++  strcpy(buf, path);
++  p = buf + strlen(buf);
++  *p++ = '/';
++
++  while(read(fd, &de, sizeof(de)) == sizeof(de)){
++    if(de.inum == 0)
++      continue;
++
++    if(strcmp(de.name, ".") == 0 || strcmp(de.name, "..") == 0)
++      continue;
++
++    memmove(p, de.name, DIRSIZ);
++    p[DIRSIZ] = 0;
++
++    if(stat(buf, &st) < 0){
++      printf("tree: cannot stat %s\n", buf);
++      continue;
++    }
++
++    tree(buf, depth + 1);
++  }
++
++  close(fd);
++}
++
++int
++main(int argc, char *argv[])
++{
++  if(argc < 2)
++    tree(".", 0);
++  else
++    tree(argv[1], 0);
++
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index f16fe27..4cee695 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,5 @@
+ struct stat;
++struct procinfo;
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int trace(int);
++int procinfo(int pid, struct procinfo *info);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..36087ff 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("trace");
++entry("procinfo");
+diff --git a/user/xargs.c b/user/xargs.c
+new file mode 100644
+index 0000000..5e31b5b
+--- /dev/null
++++ b/user/xargs.c
+@@ -0,0 +1,43 @@
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[]) {
++  if (argc < 2) {
++    fprintf(2, "Usage: xargs <command> [args...]\n");
++    exit(1);
++  }
++
++  char *command = argv[1];
++  char *cmd_args[MAXARG];
++  char buf[512];
++  int n;
++
++  for (int i = 1; i < argc; i++) {
++    cmd_args[i - 1] = argv[i];
++  }
++
++  while (1) {
++    int i = 0;
++    while ((n = read(0, &buf[i], 1)) > 0) {
++      if (buf[i] == '\n') break;
++      i++;
++    }
++
++    if (n <= 0 && i == 0) break;
++
++    buf[i] = '\0';
++    cmd_args[argc - 1] = buf;
++    cmd_args[argc] = 0;
++
++    if (fork() == 0) {
++      exec(command, cmd_args);
++      fprintf(2, "xargs: exec %s failed\n", command);
++      exit(1);
++    } else {
++      wait(0);
++    }
++  }
++
++  exit(0);
++}
+\ No newline at end of file
