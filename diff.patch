@@ -1,0 +1,211 @@
+diff --git a/Makefile b/Makefile
+index 74e454f..7b949d1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -190,6 +190,7 @@ UPROGS=\
+ 	$U/_rm\
+ 	$U/_sh\
+ 	$U/_stressfs\
++        $U/_bigfile\
+ 	$U/_usertests\
+ 	$U/_grind\
+ 	$U/_wc\
+diff --git a/kernel/file.h b/kernel/file.h
+index b076d1d..5c4eb3a 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -26,7 +26,7 @@ struct inode {
+   short minor;
+   short nlink;
+   uint size;
+-  uint addrs[NDIRECT+1];
++  uint addrs[NDIRECT+2];
+ };
+ 
+ // map major device number to device functions.
+diff --git a/kernel/fs.c b/kernel/fs.c
+index c6bab15..d4b3212 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -416,6 +416,47 @@ bmap(struct inode *ip, uint bn)
+     brelse(bp);
+     return addr;
+   }
++  bn -= NINDIRECT;
++
++  if (bn < NINDIRECT * NINDIRECT){
++    if ((addr = ip->addrs[NDIRECT + 1]) == 0){
++      addr = balloc(ip->dev);
++      if (addr == 0)
++        return 0;
++      ip->addrs[NDIRECT + 1] = addr;
++    }
++
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++
++    uint indirect_idx = bn / NINDIRECT;
++    if((addr = a[indirect_idx]) == 0){
++      addr = balloc(ip->dev);
++      if(addr){
++        a[indirect_idx] = addr;
++        log_write(bp);
++      } else {
++        brelse(bp);
++        return 0;
++      }
++    }
++    brelse(bp);
++
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++
++    uint data_idx = bn % NINDIRECT;
++    if((addr = a[data_idx]) == 0){
++      addr = balloc(ip->dev);
++      if(addr){
++        a[data_idx] = addr;
++        log_write(bp);
++      }
++    }
++    brelse(bp);
++
++    return addr;
++  }
+ 
+   panic("bmap: out of range");
+ }
+@@ -425,9 +466,9 @@ bmap(struct inode *ip, uint bn)
+ void
+ itrunc(struct inode *ip)
+ {
+-  int i, j;
+-  struct buf *bp;
+-  uint *a;
++  int i, j, k;
++  struct buf *bp, *bp2;
++  uint *a, *a2;
+ 
+   for(i = 0; i < NDIRECT; i++){
+     if(ip->addrs[i]){
+@@ -448,6 +489,28 @@ itrunc(struct inode *ip)
+     ip->addrs[NDIRECT] = 0;
+   }
+ 
++  if(ip->addrs[NDIRECT + 1]){
++    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
++    a = (uint*)bp->data;
++
++    for(j = 0; j < NINDIRECT; j++){
++      if(a[j]){
++        bp2 = bread(ip->dev, a[j]);
++        a2 = (uint*)bp2->data;
++
++        for(k = 0; k < NINDIRECT; k++){
++          if(a2[k])
++            bfree(ip->dev, a2[k]);
++        }
++        brelse(bp2);
++        bfree(ip->dev, a[j]);
++      }
++    }
++    brelse(bp);
++    bfree(ip->dev, ip->addrs[NDIRECT + 1]);
++    ip->addrs[NDIRECT + 1] = 0;
++  }
++
+   ip->size = 0;
+   iupdate(ip);
+ }
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 139dcc9..78c109d 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -24,9 +24,9 @@ struct superblock {
+ 
+ #define FSMAGIC 0x10203040
+ 
+-#define NDIRECT 12
++#define NDIRECT 11
+ #define NINDIRECT (BSIZE / sizeof(uint))
+-#define MAXFILE (NDIRECT + NINDIRECT)
++#define MAXFILE (NDIRECT + NINDIRECT + NINDIRECT * NINDIRECT)
+ 
+ // On-disk inode structure
+ struct dinode {
+@@ -35,7 +35,7 @@ struct dinode {
+   short minor;          // Minor device number (T_DEVICE only)
+   short nlink;          // Number of links to inode in file system
+   uint size;            // Size of file (bytes)
+-  uint addrs[NDIRECT+1];   // Data block addresses
++  uint addrs[NDIRECT+2];   // Data block addresses
+ };
+ 
+ // Inodes per block.
+diff --git a/kernel/param.h b/kernel/param.h
+index 80ec6d3..cb59435 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -9,7 +9,7 @@
+ #define MAXOPBLOCKS  10  // max # of blocks any FS op writes
+ #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+-#define FSSIZE       2000  // size of file system in blocks
++#define FSSIZE       200000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
+ #define USERSTACK    1     // user stack pages
+ 
+diff --git a/user/bigfile.c b/user/bigfile.c
+new file mode 100644
+index 0000000..4fd0138
+--- /dev/null
++++ b/user/bigfile.c
+@@ -0,0 +1,48 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++#include "kernel/fs.h"
++
++int
++main()
++{
++  char buf[BSIZE];
++  int fd, sectors;
++
++  fd = open("big.file", O_CREATE | O_WRONLY);
++  if(fd < 0){
++    printf("bigfile: cannot open big.file for writing\n");
++    exit(1);
++  }
++
++  sectors = 0;
++  while(1){
++    // Điền dữ liệu giả vào buffer
++    *(int*)buf = sectors;
++    
++    // Ghi 1 block (1024 bytes) vào file
++    int cc = write(fd, buf, sizeof(buf));
++    if(cc <= 0)
++      break; // Thoát vòng lặp khi không thể ghi thêm (hết giới hạn)
++
++    sectors++;
++
++    // Cứ mỗi 100 blocks được ghi thành công thì in ra một dấu chấm
++    if (sectors % 100 == 0)
++      printf(".");
++  }
++
++  printf("\nwrote %d blocks\n", sectors);
++
++  // Kiểm tra xem số block ghi được có đúng bằng giới hạn tối đa thiết kế không
++  if(sectors != 65803) {
++    printf("bigfile: file is too small\n");
++    close(fd);
++    exit(1);
++  }
++
++  printf("done; ok\n");
++  close(fd);
++  exit(0);
++}
