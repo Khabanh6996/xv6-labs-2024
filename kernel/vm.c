@@ -495,8 +495,7 @@ void vmprint_walk(pagetable_t pagetable, int level) {
       for(int j = 0; j < level; j++) printf("..");
 
       uint64 pa = PTE2PA(pte);
-      printf("%d: pte %p pa %p\n", i, pte, pa);
-
+      printf("..%d: pte %p pa %p\n", i, (void *)pte, (void *)pa);
       // Nếu nó chưa phải là node lá (không có cờ Read, Write, Exec) thì đệ quy tiếp
       if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
         uint64 child = PTE2PA(pte);
@@ -506,16 +505,12 @@ void vmprint_walk(pagetable_t pagetable, int level) {
   }
 }
 
-void vmprint(pagetable_t pagetable) {
-  printf("page table %p\n", pagetable);
-  vmprint_walk(pagetable, 1);
-}
-
 
 #ifdef LAB_PGTBL
 void
 vmprint(pagetable_t pagetable) {
-  // your code here
+  printf("page table %p\n", pagetable);
+  vmprint_walk(pagetable, 1);
 }
 #endif
 
