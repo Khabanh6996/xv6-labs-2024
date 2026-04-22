@@ -492,10 +492,13 @@ void vmprint_walk(pagetable_t pagetable, int level) {
     pte_t pte = pagetable[i];
     if(pte & PTE_V){ // Chỉ in các entry Valid
       // In ra dấu '..' phụ thuộc vào level
-      for(int j = 0; j < level; j++) printf("..");
+      for(int j = 0; j < level; j++) {
+        if(j > 0) printf(" "); // Thêm khoảng trắng giữa các cấp
+        printf("..");
+      }
 
       uint64 pa = PTE2PA(pte);
-      printf("..%d: pte %p pa %p\n", i, (void *)pte, (void *)pa);
+      printf("%d: pte %p pa %p\n", i, (void *)pte, (void *)pa);
       // Nếu nó chưa phải là node lá (không có cờ Read, Write, Exec) thì đệ quy tiếp
       if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
         uint64 child = PTE2PA(pte);
