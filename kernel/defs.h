@@ -208,6 +208,7 @@ void            virtio_disk_intr(void);
 // vmcopyin.c
 int             copyin_new(pagetable_t, char *, uint64, uint64);
 int             copyinstr_new(pagetable_t, char *, uint64, uint64);
+void            vmprint(pagetable_t);
 #endif
 
 #ifdef LAB_LOCK
